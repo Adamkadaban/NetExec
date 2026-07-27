@@ -2,8 +2,10 @@ import asyncio
 import base64
 import copy
 import contextlib
+import enum
 from datetime import datetime
 from os import getenv
+from threading import Lock
 from uuid import uuid4
 from anyio import Path
 from termcolor import colored
@@ -12,6 +14,7 @@ from impacket.krb5.ccache import CCache
 
 from nxc.connection import connection
 from nxc.helpers.bloodhound import add_user_bh
+from nxc.helpers.logger import highlight
 from nxc.logger import NXCAdapter
 from nxc.config import host_info_colors, process_secret
 from nxc.paths import NXC_PATH
@@ -22,6 +25,7 @@ from aardwolf.commons.queuedata.keyboard import RDP_KEYBOARD_UNICODE
 from aardwolf.commons.iosettings import RDPIOSettings
 from aardwolf.commons.target import RDPTarget
 from aardwolf.keyboard.layoutmanager import KeyboardLayoutManager
+from aardwolf.protocol.T128.savesessioninfopdu import LOGON_MSG_TYPE
 from aardwolf.protocol.x224.constants import SUPP_PROTOCOLS
 from aardwolf.network.x224 import X224Network
 from aardwolf.network.tpkt import TPKTPacketizer
@@ -30,6 +34,15 @@ from asyauth.common.credentials.kerberos import KerberosCredential
 from asyauth.common.constants import asyauthSecret
 from asysocks.unicomm.common.target import UniTarget, UniProto
 from asysocks.unicomm.client import UniClient
+
+
+class RDPSessionState(enum.Enum):
+    CLEAR = enum.auto()
+    CONTENTION = enum.auto()
+    UNKNOWN = enum.auto()
+
+
+SESSION_PROMPT_LOCK = Lock()
 
 
 class rdp(connection):
@@ -117,12 +130,13 @@ class rdp(connection):
             except Exception as e:
                 self.logger.debug(f"Error adding host {self.host} into db: {e!s}")
 
-    def _create_rdp_connection(self, credentials, supported_protocols=None):
+    def _create_rdp_connection(self, credentials, supported_protocols=None, request_logon_notifications=False):
         iosettings = self.iosettings.clone_for_connection()
         # Explicit protocols are used by discovery and screenshot fallbacks.
         # Authenticated connections leave this unset so aardwolf selects the
         # X224 flags appropriate for the credential type.
         iosettings.supported_protocols = supported_protocols
+        iosettings.request_logon_notifications = request_logon_notifications
         return RDPConnection(
             iosettings=iosettings,
             target=copy.deepcopy(self.target),
@@ -584,6 +598,70 @@ Add-Type -AssemblyName System.Windows.Forms
             if result is not None:
                 return result
 
+    async def _check_session_contention(self, max_wait):
+        """Check for active session contention on the current execution connection.
+
+        Returns RDPSessionState.CLEAR, .CONTENTION (with the notification object
+        attached), or .UNKNOWN. Only explicit SESSION_CONTINUE means clear.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max_wait
+
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return RDPSessionState.UNKNOWN
+
+            try:
+                pdu = await asyncio.wait_for(self.conn.logon_info_queue.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return RDPSessionState.UNKNOWN
+
+            if pdu is None:
+                return RDPSessionState.UNKNOWN
+
+            notification = pdu.logon_errors
+            if notification is None:
+                # Non-error Save Session Info (logon info v1/v2). Not authoritative
+                # for session state — keep waiting for an explicit notification.
+                continue
+            if notification.is_session_contention:
+                self._contention_notification = notification
+                return RDPSessionState.CONTENTION
+            if notification.notification_type == LOGON_MSG_TYPE.SESSION_CONTINUE:
+                return RDPSessionState.CLEAR
+            # Refusal/error types — treat as unknown
+            return RDPSessionState.UNKNOWN
+
+    def _prompt_session_contention(self, notification):
+        """Ask the operator whether to take over the active session."""
+        notification_name = getattr(notification.notification_type, "name", "SESSION_CONTENTION")
+        prompt = highlight(
+            f"[!] Active RDP session detected ({notification_name}). "
+            "Proceed with takeover? [y/N] ",
+            "red",
+        )
+        try:
+            with SESSION_PROMPT_LOCK:
+                answer = input(prompt)
+        except EOFError:
+            return False
+        return answer.lower() in ("y", "yes")
+
+    async def _approve_session_takeover(self):
+        """Approve the Windows Winlogon session contention dialog via keyboard.
+
+        The dialog has "Yes" and "No" buttons with "No" focused by default.
+        We press Left arrow to move focus to "Yes", then Enter to confirm.
+        """
+        await self.conn.send_key_scancode(0x4B, True, True)   # Left press (extended)
+        await asyncio.sleep(0.1)
+        await self.conn.send_key_scancode(0x4B, False, True)   # Left release
+        await asyncio.sleep(0.1)
+        await self.conn.send_key_virtualkey("VK_RETURN", True, False)
+        await asyncio.sleep(0.1)
+        await self.conn.send_key_virtualkey("VK_RETURN", False, False)
+
     async def execute_shell(self, payload, get_output, shell_type):
         marker = uuid4().hex if get_output else None
         command = self._build_execution_command(
@@ -591,8 +669,13 @@ Add-Type -AssemblyName System.Windows.Forms
         )
         self.logger.debug(f"Executing {shell_type} command through {'an encoded PowerShell launcher' if get_output else 'interactive keyboard input'}")
 
+        # Connect WITH logon notifications so we detect contention on this connection
+        force = getattr(self.args, "force_rdp_exec", False)
         try:
-            self.conn = self._create_rdp_connection(self.auth)
+            self.conn = self._create_rdp_connection(
+                self.auth,
+                request_logon_notifications=not force,
+            )
             await self.connect_rdp()
         except Exception as e:
             self.logger.debug(f"Error connecting to RDP: {e!s}")
@@ -602,6 +685,32 @@ Add-Type -AssemblyName System.Windows.Forms
             return None
 
         try:
+            # Check session contention on the execution connection itself
+            if not force:
+                session_timeout = getattr(self.args, "session_check_timeout", 30)
+                session_state = await self._check_session_contention(session_timeout)
+
+                if session_state == RDPSessionState.CONTENTION:
+                    approved = self._prompt_session_contention(self._contention_notification)
+                    if not approved:
+                        self.logger.display("Existing RDP session preserved; command execution cancelled.")
+                        return None
+                    self.logger.display("Requesting RDP session takeover.")
+                    await self._approve_session_takeover()
+                    # Wait for Windows to confirm the takeover
+                    confirm = await self._check_session_contention(session_timeout)
+                    if confirm != RDPSessionState.CLEAR:
+                        self.logger.fail("RDP session takeover was not confirmed by the server.")
+                        return None
+                elif session_state == RDPSessionState.UNKNOWN:
+                    self.logger.fail(
+                        "Unable to determine RDP session state; command execution cancelled. "
+                        "Use --force-rdp-exec to bypass."
+                    )
+                    return None
+                # CLEAR — proceed normally
+
+            self.logger.success(f"Executing command: {payload}")
             if get_output:
                 self.logger.success("Waiting for clipboard to be ready...")
                 try:

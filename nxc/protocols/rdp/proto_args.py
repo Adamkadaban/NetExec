@@ -22,6 +22,8 @@ def proto_args(parser, parents):
     cgroup.add_argument("-X", metavar="PS_COMMAND", dest="ps_execute", help="execute the specified PowerShell command")
     cgroup.add_argument("--cmd-delay", type=int, default=5, help="Delay before executing the command and before disconnecting with --no-output")
     cgroup.add_argument("--clipboard-delay", type=int, default=30, help="Maximum time to wait for clipboard initialization and command output")
+    cgroup.add_argument("--session-check-timeout", type=int, default=30, help="Maximum time to wait for the RDP session-state notification")
     cgroup.add_argument("--no-output", action="store_true", help="do not retrieve command output")
+    cgroup.add_argument("--force-rdp-exec", action="store_true", help="skip session contention detection and proceed with command execution")
 
     return parser
