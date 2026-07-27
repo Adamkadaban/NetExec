@@ -601,8 +601,11 @@ Add-Type -AssemblyName System.Windows.Forms
     async def _check_session_contention(self, max_wait):
         """Check for active session contention on the current execution connection.
 
-        Returns RDPSessionState.CLEAR, .CONTENTION (with the notification object
-        attached), or .UNKNOWN. Only explicit SESSION_CONTINUE means clear.
+        Returns RDPSessionState.CLEAR, .CONTENTION, or .UNKNOWN.
+        When no notification arrives within max_wait, the server has no
+        contention to report — this is the normal uncontested case (CLEAR).
+        Only explicit contention PDUs trigger CONTENTION, and only explicit
+        refusal/error PDUs trigger UNKNOWN (fail-closed).
         """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + max_wait
@@ -610,27 +613,30 @@ Add-Type -AssemblyName System.Windows.Forms
         while True:
             remaining = deadline - loop.time()
             if remaining <= 0:
-                return RDPSessionState.UNKNOWN
+                # No notification received — the server has nothing to report.
+                # This is the normal non-contention case.
+                return RDPSessionState.CLEAR
 
             try:
                 pdu = await asyncio.wait_for(self.conn.logon_info_queue.get(), timeout=remaining)
             except asyncio.TimeoutError:
-                return RDPSessionState.UNKNOWN
+                return RDPSessionState.CLEAR
 
             if pdu is None:
+                # Connection terminated during wait
                 return RDPSessionState.UNKNOWN
 
             notification = pdu.logon_errors
             if notification is None:
-                # Non-error Save Session Info (logon info v1/v2). Not authoritative
-                # for session state — keep waiting for an explicit notification.
+                # Non-error Save Session Info (logon info v1/v2). Not relevant
+                # for session contention — keep waiting.
                 continue
             if notification.is_session_contention:
                 self._contention_notification = notification
                 return RDPSessionState.CONTENTION
             if notification.notification_type == LOGON_MSG_TYPE.SESSION_CONTINUE:
                 return RDPSessionState.CLEAR
-            # Refusal/error types — treat as unknown
+            # Refusal/error types — fail closed
             return RDPSessionState.UNKNOWN
 
     def _prompt_session_contention(self, notification):
@@ -648,20 +654,6 @@ Add-Type -AssemblyName System.Windows.Forms
             return False
         return answer.lower() in ("y", "yes")
 
-    async def _approve_session_takeover(self):
-        """Approve the Windows Winlogon session contention dialog via keyboard.
-
-        The dialog has "Yes" and "No" buttons with "No" focused by default.
-        We press Left arrow to move focus to "Yes", then Enter to confirm.
-        """
-        await self.conn.send_key_scancode(0x4B, True, True)   # Left press (extended)
-        await asyncio.sleep(0.1)
-        await self.conn.send_key_scancode(0x4B, False, True)   # Left release
-        await asyncio.sleep(0.1)
-        await self.conn.send_key_virtualkey("VK_RETURN", True, False)
-        await asyncio.sleep(0.1)
-        await self.conn.send_key_virtualkey("VK_RETURN", False, False)
-
     async def execute_shell(self, payload, get_output, shell_type):
         marker = uuid4().hex if get_output else None
         command = self._build_execution_command(
@@ -669,13 +661,46 @@ Add-Type -AssemblyName System.Windows.Forms
         )
         self.logger.debug(f"Executing {shell_type} command through {'an encoded PowerShell launcher' if get_output else 'interactive keyboard input'}")
 
-        # Connect WITH logon notifications so we detect contention on this connection
+        # Check for active session contention before executing
         force = getattr(self.args, "force_rdp_exec", False)
+        if not force:
+            try:
+                probe_conn = self._create_rdp_connection(
+                    self.auth,
+                    request_logon_notifications=True,
+                )
+                self.conn = probe_conn
+                await self.connect_rdp()
+            except Exception as e:
+                self.logger.debug(f"Error connecting for session check: {e!s}")
+                if "CredSSP" in str(e) or "STATUS_LOGON" in str(e):
+                    self.logger.fail(f"Authentication failed: {e!s}")
+                await self.terminate_conn()
+                return None
+
+            try:
+                session_timeout = getattr(self.args, "session_check_timeout", 30)
+                session_state = await self._check_session_contention(session_timeout)
+
+                if session_state == RDPSessionState.CONTENTION:
+                    approved = self._prompt_session_contention(self._contention_notification)
+                    if not approved:
+                        self.logger.display("Existing RDP session preserved; command execution cancelled.")
+                        return None
+                    # User approved — we'll reconnect without notifications to force takeover
+                elif session_state == RDPSessionState.UNKNOWN:
+                    self.logger.fail(
+                        "Server refused the RDP session; command execution cancelled. "
+                        "Use --force-rdp-exec to bypass."
+                    )
+                    return None
+                # CLEAR — proceed normally
+            finally:
+                await self.terminate_conn()
+
+        # Connect for execution WITHOUT logon notifications (silently takes over if needed)
         try:
-            self.conn = self._create_rdp_connection(
-                self.auth,
-                request_logon_notifications=not force,
-            )
+            self.conn = self._create_rdp_connection(self.auth)
             await self.connect_rdp()
         except Exception as e:
             self.logger.debug(f"Error connecting to RDP: {e!s}")
@@ -685,31 +710,6 @@ Add-Type -AssemblyName System.Windows.Forms
             return None
 
         try:
-            # Check session contention on the execution connection itself
-            if not force:
-                session_timeout = getattr(self.args, "session_check_timeout", 30)
-                session_state = await self._check_session_contention(session_timeout)
-
-                if session_state == RDPSessionState.CONTENTION:
-                    approved = self._prompt_session_contention(self._contention_notification)
-                    if not approved:
-                        self.logger.display("Existing RDP session preserved; command execution cancelled.")
-                        return None
-                    self.logger.display("Requesting RDP session takeover.")
-                    await self._approve_session_takeover()
-                    # Wait for Windows to confirm the takeover
-                    confirm = await self._check_session_contention(session_timeout)
-                    if confirm != RDPSessionState.CLEAR:
-                        self.logger.fail("RDP session takeover was not confirmed by the server.")
-                        return None
-                elif session_state == RDPSessionState.UNKNOWN:
-                    self.logger.fail(
-                        "Unable to determine RDP session state; command execution cancelled. "
-                        "Use --force-rdp-exec to bypass."
-                    )
-                    return None
-                # CLEAR — proceed normally
-
             self.logger.success(f"Executing command: {payload}")
             if get_output:
                 self.logger.success("Waiting for clipboard to be ready...")
@@ -720,6 +720,19 @@ Add-Type -AssemblyName System.Windows.Forms
                     return None
 
             await self._wait_for_desktop()
+
+            if get_output:
+                # On first RDP logon after boot, Explorer may not be ready to
+                # process Win+R immediately after the desktop appears. This
+                # no-op warmup command absorbs the race: if the shell isn't
+                # ready it silently fails, and the 3-second pause gives Explorer
+                # time to finish initialization before the real command.
+                await self._submit_typed_run_command(
+                    "powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden "
+                    '-Command "Add-Type -AssemblyName System.Windows.Forms"'
+                )
+                await asyncio.sleep(3)
+
             if get_output:
                 try:
                     await self._submit_run_command(command)
